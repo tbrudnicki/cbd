@@ -1,0 +1,124 @@
+sequenceDiagram
+
+
+box Kevlar 
+    participant lending as Lending Service
+    participant lendingdb as Lending Service DB
+    participant docHub as Kevlar Document Hub<br>Service
+    participant cards as Cards Service
+end 
+
+box Enterprise
+    participant ot as OpentText
+    participant mule as Mule
+    participant edm as Enterprise Document<br>Store (Sharepoint)
+    participant crm as OpenCRM
+    actor creditOfficer as Credit Officer
+end
+
+participant aecb as AECB 
+
+note over ot : Received Processing Request <br> Application ID, Application Files (ref to EDMS) - Personal Statement Files Company Statements, VAT Statements<br> Expected Credit Limit  <br>Application Type : [Credit Limit Increase, Credit Card Issuance]<br>Company Details - Mandatory (TradeLicenseNumber, PrimaryPhoneNumber,<br> CompanyName, Registered Emirate Id)<br> Personal Details - Optional (Full Name, Gender, DOB, Nationality - Country Code,<br> Emirates National Id, PassportNumber, PhoneNumber)
+
+
+note over ot : Step 1:  AECB Report Collection
+
+ot ->> docHub : Get Company AECB report from 30 days
+note right of docHub : parameter: Irim
+docHub -->> ot : AECB Company Report for Irim Response
+
+alt Company AECB Report Exists
+    ot ->> edm : Upload AECB Report into application files
+    edm -->> ot : Success
+else Company AECB Report Doesn't Exists
+    ot ->> aecb : Request AECB Report for Company
+    aecb -->> ot : AECB Report for Company
+
+    ot ->> docHub : Upload AECB report for Company
+    note right of docHub : parameter: Irim, report date: <yyyy-MM-dd>
+    docHub -->> ot : Success
+    ot ->> edm : Upload AECB Report into application files
+    edm -->> ot : Success
+end 
+
+alt Provided Personal Info 
+    ot ->> docHub : Get Personal AECB report from 30 days
+    note right of docHub : parameter: personalRim
+    docHub -->> ot : AECB Personal Report for personalRim
+    
+
+    alt Personal AECB Report Exists
+        ot ->> edm : Upload Personal AECB Report into application files
+        edm -->> ot : Success
+    else Personal AECB Report Doesn't Exists
+        ot ->> aecb : Request AECB Report for Person
+        aecb -->> ot : AECB Report for Person
+
+        ot ->> docHub : Upload AECB report for Person
+        note right of docHub : parameter: personalRim, report date: <yyyy-MM-dd>
+        docHub -->> ot : Success
+        ot ->> edm : Upload AECB Report into application files
+        edm -->> ot : Success
+    end
+
+end
+
+ot ->> ot : Generate Application PDF 
+note over ot : Store All application information into PDF
+
+ot ->> edm : Upload Application PDF
+edm -->> ot : Success
+
+note over ot: Step 2 : Create OpenCRM case
+
+alt Application Type = CHANNEL_CREDIT_CARD_ISSUANCE
+    ot ->> crm : Create CREDIT_CARD_ISSUANCE case
+    crm -->> ot : Success
+else Application Type = CREDIT_LIMIT_INCREASE
+    ot ->> crm : Create CREDIT_LIMIT_INCREASE case
+    crm -->> ot : Success
+end
+
+
+
+note over ot : Step 3 Application Decision
+
+ot ->> ot : Credit Decision Form
+creditOfficer ->> edm : Review Application Documents
+creditOfficer ->> creditOfficer : Application Decision
+creditOfficer ->> ot : Fill Credit Decision Form, Submit Decision
+ot -->
+
+ot ->> lending : Submit Application Decision
+
+
+note right of lending : data: Application ID, Decision = [Approved,Reject], Approved Credit Limit
+
+lending ->> lendingdb : Fetch Application by ID:
+lendingdb -->> lending: Application Data
+
+alt Application Decision = Approved
+    alt Application Type = CHANNEL_CREDIT_CARD_ISSUANCE
+        lending ->> mule : v1/Credit/CardAdd
+        mule -->> lending : Success
+    else Application Type = CREDIT_LIMIT_INCREASE
+        lending ->> mule : v1/CardLmtMod
+        mule -->> lending : Success
+    end
+    lending ->> lendingdb : Update Application Status = Approved
+
+else Application Decision = Reject 
+
+    lending ->> lendingdb : Update Application Status = Reject
+end
+
+lending -->> ot : Success
+
+
+note over ot : Step 4 Update OpenCRM case
+
+ot ->> crm : Update OpenCRM case 
+crm -->> ot : Updated
+
+note over ot : Step 4 Terminate
+ot ->> ot : Terminate

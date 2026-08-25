@@ -1,0 +1,196 @@
+sequenceDiagram
+        autonumber
+        actor owner as Owner
+        participant mobile as Kevlar App
+        box Cards Service
+            participant cards as Cards Service
+            participant cardsbatch as Cards Batch<br>Processing
+            participant cardslisting as Cards Listing Component
+        end
+        participant cardsdb as Database
+        participant blob as Application File Store<br> Azure Blob Storage
+        participant aecb_blob as Channel Documents Store<br>Azure Blob Store
+        participant mule as Mule
+
+        box Enterprise
+            participant ot as OpenText
+        end
+
+        note over mobile, ot : Application Data Collection
+        owner ->> mobile : Select Request For Credit Card Issuance <br>or Increase Credit Limit
+        mobile ->> cards : Start Applictaion type = [CHANNEL_CREDIT_CARD_ISSUANCE, CREDIT_LIMIT_INCREASE] 
+
+        alt Application Type = CHANNEL_CREDIT_CARD_ISSUANCE
+            cards ->> cardsdb : Fetch credit cards for company_rim
+            
+            opt Credit Card Already Issued
+                cards -->> mobile : Error Response
+            end
+
+            
+
+            cards ->> cardsdb : Fetch last credit issuance application for company_rim from last 30 days
+
+            alt Not Eligible For Application
+                cards -->> mobile : Error Response
+            end 
+            note left of cardsdb : data: irim, requestor personal_rim, company_rim<br>status=INITIATED,TYPE=CHANNEL_CREDIT_CARD_ISSUANCE, creditCardId
+            cards ->> cardsdb : Store Application Record 
+            cardsdb -->> cards : Stored
+
+        else Application Type = CREDIT_LIMIT_INCREASE
+            cards ->> cardsdb : Fetch credit cards for company_rim
+            
+            opt No Credit Cards Issued
+                cards -->> mobile : Error Response
+            end
+
+            cards ->> cardsdb : Fetch applications for company_rim from last 30 days
+
+            opt Credit Increase Application within last 30 days
+                cards -->> mobile : Error Response
+            end 
+
+            opt Card Issance Application not from onbarding within last 30 days 
+                cards -->> mobile : Error Response
+            end  
+
+            note left of cardsdb : data: irim, requestor personal_rim, company_rim<br>status=INITIATED,TYPE=CREDIT_LIMIT_INCREASE, creditCardId
+            cards ->> cardsdb : Store Application Record 
+            cardsdb -->> cards : Stored
+        end 
+
+        
+
+        cards -->> mobile : Success Response: Application_ID : UUID
+
+        mobile ->> owner : Collect Credit Bureau Consent
+        owner -->> mobile : Consent Confirmed
+        mobile -->> cards : Attach User Consent To Application
+
+
+        cards ->> cardsdb : Store User Consent 
+        cardsdb -->> cards : Stored
+
+        cards -->> mobile : Success
+        
+
+
+        mobile ->> owner : Collect Business Account Bank Statements
+        owner -->> mobile : Provide Business Account Bank Statements
+
+        mobile ->> cards : Upload application files type = BUSINESS_ACCOUNT_STATEMENT
+        loop For Each File
+            cards ->> cards : Validate file extension *.pdf
+            cards ->> cards : Validate file size < 5MB
+
+            cards ->> blob : Store application files
+            blob ->> cards : Success
+            cards ->> cardsdb : Store uploaded files informaion
+            cardsdb ->> cards : Stored
+        end 
+
+        cards -->> mobile : Success
+
+        mobile ->> owner : Collect Personal Account Bank Statements
+        owner -->> mobile : Provide Business Account Bank Statements
+        
+        mobile ->> cards : Upload application files type = PERSONAL_ACCOUNT_STATEMENT
+        loop For Each File
+            cards ->> cards : Validate file extension *.pdf
+            cards ->> cards : Validate file size < 5MB
+
+            cards ->> blob : Store application files
+            blob ->> cards : Success
+            cards ->> cardsdb : Store uploaded files informaion
+            cardsdb ->> cards : Stored
+        end 
+
+        cards -->> mobile : Success
+        
+
+        mobile ->> owner : Collect VAT Statements
+        owner -->> mobile : Provide VAT Statements
+
+        mobile ->> cards : Upload VAT Statements
+        loop For Each File
+            cards ->> cards : Validate file extension *.pdf
+            cards ->> cards : Validate file size < 5MB
+
+            cards ->> blob : Store application files
+            blob ->> cards : Success
+            cards ->> cardsdb : Store uploaded files informaion
+            cardsdb ->> cards : Stored
+        end 
+
+        cards -->> mobile : Success
+
+        mobile ->> owner : Collect Expected Credit Line Amount
+        owner -->> mobile : Collect Expected Credit Line Amount
+
+        mobile ->> cards : Send Expected Credit Line Amount
+    
+        cards ->> cardsdb : Store Expected Credit Line Amount
+        cardsdb ->> cards : Stored
+
+        cards -->> mobile : Success
+        mobile ->> owner : Request Confirmation
+        
+        owner -->> mobile : Confirmed
+        mobile ->> cards : Request Start Processing
+
+        cards ->> cards : Validate Application Completness
+
+        note over cards : Collect Additional Data
+
+        cards ->> mule : Get Company Details: POST :v1/PartyIng 
+        note left of mule : PartyId : <irim>
+        mule -->> cards : Company Details Response
+
+        cards ->> cards : Extract TradeLicenseNumber, PrimaryPhoneNumber,<br> CompanyName, Registered Emirate Id
+
+        note over cards : Missing Emirate ID??
+
+        opt AECB personal consent = true
+            cards ->> mule : Get Personal Details: POST :v1/PartyIng 
+            note left of mule : PartyId : <personalRim>
+            mule -->> cards : Personal Details Response
+            cards ->> cards : Extract Full Name, Gender, DOB, Nationality - Country Code,<br> Emirates National Id, PassportNumber, PhoneNumber
+
+        end
+
+        cards ->> ot : Request Start of Processing
+        ot -->> cards : Success
+        cards ->> cardsdb : Update Application Status PROCESSING
+        cardsdb -->> cards : Updated
+        cards -->> mobile : Credit Limit Increase Process Started Response
+        mobile -->> owner : View Porcess Started Confirmation Screen
+        
+        note over ot : request: <br> Application ID, Application Files (ref to EDMS) - Personal Statement Files Company Statements, VAT Statements<br> Expected Credit Limit  <br>Application Type : [Credit Limit Increase, Credit Card Issuance]<br>Company Details - Mandatory (TradeLicenseNumber, PrimaryPhoneNumber,<br> CompanyName, Registered Emirate Id)<br> Personal Details - Optional (Full Name, Gender, DOB, Nationality - Country Code,<br> Emirates National Id, PassportNumber, PhoneNumber)
+        cardsbatch ->> cardsdb : Update Credit Line Application Status = PROCESSING
+        cardsdb -->> cardsbatch : Updated
+
+        note over ot : Processing Started
+        
+
+        note over mobile, ot : Listing Cards
+
+        owner ->> mobile : Open Cards List View
+        mobile ->> cards : List Owner Cards
+        cards ->> cardslisting : List Cards
+
+        cardslisting ->> cardsdb : Select Active Cards For IRIM
+        cardsdb -->> cardslisting : Query Result
+        cardslisting -->> cards : List Cards Result
+        
+        cards ->> cardsdb : Select Pending Cards Issuance Application
+        cardsdb -->> cards : Pending Cards Issuance Application
+
+        cards -->> mobile : List Owner Cards Result
+        mobile -->> owner : Present Cards List View
+
+    
+        %% https://www.figma.com/design/yOotMefSp1SvNg3DiqI5Jh/Cards?node-id=5884-45532&t=G9pBHmkAPqakfttu-4
+
+    
+    

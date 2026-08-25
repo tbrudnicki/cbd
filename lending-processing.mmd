@@ -1,0 +1,133 @@
+sequenceDiagram
+
+
+box Kevlar 
+    participant cards as Cards Service
+    participant cardsdb as Cards Service DB
+    participant docHub as Kevlar Document Hub
+    participant blob as Kevlar General Purpose<br>Azure Blob 
+end 
+
+box Enterprise
+    participant ot as OpentText
+    participant mule as Mule
+    participant edm as Enterprise Document<br>Store (Sharepoint)
+    participant crm as OpenCRM
+    actor creditOfficer as Credit Officer
+end
+
+participant aecb as AECB 
+
+note over ot : Received Processing Request <br> Application ID, Application Files (ref to EDMS) - Personal Statement Files Company Statements, VAT Statements<br> Expected Credit Limit  <br>Application Type : [Credit Limit Increase, Credit Card Issuance]<br>Company Details - Mandatory (TradeLicenseNumber, PrimaryPhoneNumber,<br> CompanyName, Registered Emirate Id)<br> Personal Details - Optional (Full Name, Gender, DOB, Nationality - Country Code,<br> Emirates National Id, PassportNumber, PhoneNumber)
+
+note over ot : Step 1: Upload Data To EDMS
+
+loop For Each Credit Application File
+    ot ->> blob: Open Stream to Application File
+    blob -->> ot : Opened
+    ot ->> edm : Store Application File
+    edm -->> ot : Stored
+end
+
+note over ot : Step 2:  AECB Report Collection
+
+ot ->> docHub : Get Company AECB report from 30 days
+note right of docHub : parameter: Irim
+docHub -->> ot : AECB Company Report for Irim Response
+
+alt Company AECB Report Exists
+    ot ->> edm : Upload AECB Report into application files
+    edm -->> ot : Success
+else Company AECB Report Doesn't Exists
+    ot ->> aecb : Request AECB Report for Company
+    aecb -->> ot : AECB Report for Company
+
+    ot ->> docHub : Upload AECB report for Company
+    note right of docHub : parameter: Irim, report date: <yyyy-MM-dd>
+    docHub -->> ot : Success
+    ot ->> edm : Upload AECB Report into application files
+    edm -->> ot : Success
+end 
+
+alt Provided Personal Info 
+    ot ->> docHub : Get Personal AECB report from 30 days
+    note right of docHub : parameter: personalRim
+    docHub -->> ot : AECB Personal Report for personalRim
+    
+
+    alt Personal AECB Report Exists
+        ot ->> edm : Upload Personal AECB Report into application files
+        edm -->> ot : Success
+    else Personal AECB Report Doesn't Exists
+        ot ->> aecb : Request AECB Report for Person
+        aecb -->> ot : AECB Report for Person
+
+        ot ->> docHub : Upload AECB report for Person
+        note right of docHub : parameter: personalRim, report date: <yyyy-MM-dd>
+        docHub -->> ot : Success
+        ot ->> edm : Upload AECB Report into application files
+        edm -->> ot : Success
+    end
+
+end
+
+ot ->> ot : Generate Application PDF 
+note over ot : Store All application information into PDF
+
+ot ->> edm : Upload Application PDF
+edm -->> ot : Success
+
+note over ot: Step 3 : OpenCRM
+
+alt Application Type = CHANNEL_CREDIT_CARD_ISSUANCE
+    ot ->> crm : Create CRM lead Credit Card Issuance
+    crm -->> ot : Success
+else Application Type = CREDIT_LIMIT_INCREASE
+    ot ->> crm : Create CRM case for Credit Limit Increase
+    crm -->> ot : Success
+end
+
+
+
+note over ot : Step 4 Application Decision
+
+ot ->> ot : Credit Decision Form
+creditOfficer ->> edm : Review Application Documents
+creditOfficer ->> creditOfficer : Application Decision
+creditOfficer ->> ot : Fill Credit Decision Form, Submit Decision
+ot ->> cards : Submit Application Decision
+note right of cards : data: Application ID, Decision = [Approved,Reject], Approved Credit Limit
+
+cards ->> cardsdb : Fetch Application by ID:
+cardsdb -->> cards: Application Data
+
+alt Application Decision = Approved
+    alt Application Type = CHANNEL_CREDIT_CARD_ISSUANCE
+        cards ->> cardsdb : Store Cards Details
+        cardsdb -->> cards : Stored
+        cards ->> mule : Issue Credit Card with approved limit POST: /v1/Credit/CardAdd
+        mule -->> cards : Success
+    else Application Type = CREDIT_LIMIT_INCREASE
+        cards ->> mule : Modify Credit Card Limit with approved amount POST: /v1/CardLmtMod
+        mule -->> cards : Success
+    end
+    cards ->> cardsdb : Update Application Status = Approved
+
+else Application Decision = Reject 
+    cards ->> cardsdb : Update Application Status = Reject
+end
+note over cards : Send Notification
+cards -->> ot : Success
+
+
+note over ot : Step 5 Update OpenCRM 
+alt Application Type = CHANNEL_CREDIT_CARD_ISSUANCE
+    ot ->> crm : Convert CRM lead into oportunity
+    crm -->> ot : Success
+else Application Type = CREDIT_LIMIT_INCREASE
+    ot ->> crm : Update CRM case
+    crm -->> ot : Success
+end
+
+note over ot : Step 6 Terminate
+ot ->> ot : Terminate

@@ -1,0 +1,71 @@
+---
+config:
+  theme: forest
+---
+sequenceDiagram
+  box rgb(255, 255, 255) Service Layer
+    participant svc as Card Service
+    participant blob as Channel AECB Store<br>Azure Blob Store
+    participant docHub as Document Hub
+  end
+  box rgb(255, 255, 255) Enterprise Layer
+    participant OT as OpenText
+  end
+  box rgb(255, 255, 255) Azure
+    participant apim as Internal APIM
+  end
+  autonumber
+
+  Note over OT, svc: STAGE 5d: Provision Cards
+  Note over OT: This stage provisions debit card (mandatory) <br/>and credit card (if eligible) for the business account
+
+  rect rgb(245, 255, 245)
+    Note over OT, svc: Step 1: Provision Debit Card
+
+    opt Check debit eligibility
+      note over OT: Request for Admin or PoA (signatory)
+      OT ->> svc: Request card provisioning <br/>POST bff/cards/issuance/request-new/onboarding/_post<br/>[cardLabelName: 'Company card', cardType: 'DEBIT', username: 'admin', userRoles: 'OWNER', <br/>nonPersonalRim:'<nonPersonalRim>', personalRim: '<personalRim>', irim: '<irim>', <br/>assignedTo: 'OWNER', employeeId: '<empty>']
+      svc -->> OT: Provisioning started
+    end
+  end
+
+  rect rgb(255, 250, 245)
+    Note over OT, svc: Step 2: Provision Credit Card
+    opt if Company Type is Sole Proprietary
+      note over svc, OT: Company Type: Sole Proprietary
+      
+      opt Check credit eligibility AECB Company Cheque Bounce < 5 & Score > 570
+        note over OT: AECB Company: Cheque Bounce < 5 & Score > 570
+        note over OT: Request is for Admin or PoA (signatory)
+        note over OT: Credit Limit: 100 AED
+        
+        alt Application Approved
+          note over OT : Use Service Key For Authorization
+          OT ->> apim : Store Credit Card Application Result<br/>[cardLabelName: 'Company card', username: 'admin', userRoles: 'OWNER', <br/>nonPersonalRim:'<nonPersonalRim>', personalRim: '<personalRim>', irim: '<irim>', <br/>assignedTo: 'OWNER', employeeId: '<empty>', 'status':'APPROVED', 'applicationType' : 'ONBOARDING_CREDIT_CARD_APPLICATION']
+          note over apim : Service Key Authorization
+          apim ->> svc :  Store Credit Application
+          note over svc : Issue Credit Card
+          note over svc : Store Application Data
+        
+          svc -->> apim : Application Data Stored
+          apim -->> OT : Application Data Stored 
+        else Application Rejected
+          note over OT : Use Service Key For Authorization
+          OT ->> apim : Store Credit Card Application Result<br/>[cardLabelName: 'Company card', username: 'admin', userRoles: 'OWNER', <br/>nonPersonalRim:'<nonPersonalRim>', personalRim: '<personalRim>', irim: '<irim>', <br/>assignedTo: 'OWNER', employeeId: '<empty>', 'status':'REJECT', 'applicationType' : 'ONBOARDING_CREDIT_CARD_APPLICATION']
+          note over apim : Service Key Authorization
+          apim ->> svc :  Store Credit Application
+          note over svc : Store Application Data
+          
+          svc -->> apim : Application Data Stored
+          apim -->> OT : Application Data Stored 
+        end
+        OT ->> docHub : Store AECB report for company
+        docHub -->> OT : Stored
+      end
+    end
+  end
+
+  Note over OT: Card provisioning completed
+
+%%   https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow
+%% https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-on-behalf-of-flow

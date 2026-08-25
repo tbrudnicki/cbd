@@ -1,0 +1,213 @@
+sequenceDiagram
+        autonumber
+        actor owner as Owner
+        participant mobile as Kevlar App
+        box Lending Service
+            participant lending as Lending Service
+            participant lendingbatch as Lending Batch<br>Processing
+            participant lendinglisting as lending Listing Component
+            participant lendingdb as Database
+        end
+        
+
+        participant cards as Cards Service
+        participant blob as Application File Store<br> Azure Blob Storage
+        participant aecb_blob as Channel Documents Store<br>Azure Blob Store
+        participant mule as Mule
+
+        box Enterprise
+            participant ot as OpenText
+            participant edm as Enterprise Document<br>Store (Sharepoint)
+        end
+
+        note over mobile, edm : Application Data Collection
+        owner ->> mobile : Select Request For Credit Card Issuance <br>or Increase Credit Limit
+        mobile ->> lending : Start Applictaion type = [CHANNEL_CREDIT_CARD_ISSUANCE, CREDIT_LIMIT_INCREASE] 
+
+        alt Application Type = CHANNEL_CREDIT_CARD_ISSUANCE
+            lending ->> cards : List Cards for company
+            cards -->> lending : Cards List Response
+            
+            opt Credit Card Already Issued
+                lending -->> mobile : Error Response
+            end
+
+            lending ->> lendingdb : Fetch last credit issuance application for company_rim from last 30 days
+
+            alt Not Eligible For Application
+                lending -->> mobile : Error Response
+            end 
+            note left of lendingdb : data: irim, requestor personal_rim, company_rim<br>status=INITIATED,TYPE=CHANNEL_CREDIT_CARD_ISSUANCE, creditCardId
+            lending ->> lendingdb : Store Application Record 
+            lendingdb -->> lending : Stored
+
+        else Application Type = CREDIT_LIMIT_INCREASE
+            lending ->> lendingdb : Fetch credit lending for company_rim
+            
+            opt No Credit lending Issued
+                lending -->> mobile : Error Response
+            end
+
+            lending ->> lendingdb : Fetch applications for company_rim from last 30 days
+
+            opt Credit Increase Application within last 30 days
+                lending -->> mobile : Error Response
+            end 
+
+            opt Card Issance Application not from onbarding within last 30 days 
+                lending -->> mobile : Error Response
+            end  
+
+            note left of lendingdb : data: irim, requestor personal_rim, company_rim<br>status=INITIATED,TYPE=CREDIT_LIMIT_INCREASE, creditCardId
+            lending ->> lendingdb : Store Application Record 
+            lendingdb -->> lending : Stored
+        end 
+
+        
+
+        lending -->> mobile : Success Response: Application_ID : UUID
+
+        mobile ->> owner : Collect Credit Bureau Consent
+        owner -->> mobile : Consent Confirmed
+        mobile -->> lending : Attach User Consent To Application
+
+
+        lending ->> lendingdb : Store User Consent 
+        lendingdb -->> lending : Stored
+
+        lending -->> mobile : Success
+        
+
+
+        mobile ->> owner : Collect Business Account Bank Statements
+        owner -->> mobile : Provide Business Account Bank Statements
+
+        mobile ->> lending : Upload application files type = BUSINESS_ACCOUNT_STATEMENT
+        loop For Each File
+            lending ->> lending : Validate file extension *.pdf
+            lending ->> lending : Validate file size < 5MB
+
+            lending ->> blob : Store application files
+            blob ->> lending : Success
+            lending ->> lendingdb : Store uploaded files informaion
+            lendingdb ->> lending : Stored
+        end 
+
+        lending -->> mobile : Success
+
+        mobile ->> owner : Collect Personal Account Bank Statements
+        owner -->> mobile : Provide Business Account Bank Statements
+        
+        mobile ->> lending : Upload application files type = PERSONAL_ACCOUNT_STATEMENT
+        loop For Each File
+            lending ->> lending : Validate file extension *.pdf
+            lending ->> lending : Validate file size < 5MB
+
+            lending ->> blob : Store application files
+            blob ->> lending : Success
+            lending ->> lendingdb : Store uploaded files informaion
+            lendingdb ->> lending : Stored
+        end 
+
+        lending -->> mobile : Success
+        
+
+        mobile ->> owner : Collect VAT Statements
+        owner -->> mobile : Provide VAT Statements
+
+        mobile ->> lending : Upload VAT Statements
+        loop For Each File
+            lending ->> lending : Validate file extension *.pdf
+            lending ->> lending : Validate file size < 5MB
+
+            lending ->> blob : Store application files
+            blob ->> lending : Success
+            lending ->> lendingdb : Store uploaded files informaion
+            lendingdb ->> lending : Stored
+        end 
+
+        lending -->> mobile : Success
+
+        mobile ->> owner : Collect Expected Credit Line Amount
+        owner -->> mobile : Collect Expected Credit Line Amount
+
+        mobile ->> lending : Send Expected Credit Line Amount
+    
+        lending ->> lendingdb : Store Expected Credit Line Amount
+        lendingdb ->> lending : Stored
+
+        lending -->> mobile : Success
+        mobile ->> owner : Request Confirmation
+        
+        owner -->> mobile : Confirmed
+        mobile ->> lending : Request Start Processing
+
+        lending ->> lending : Validate Application Completness
+
+        
+
+        lending ->> lendingdb : Update Application Status COMPLETED
+        lendingdb -->> lending : Updated
+        lending -->> mobile : Credit Limit Increase Process Started Response
+        mobile -->> owner : View Porcess Started Confirmation Screen
+        note over mobile, edm : Storing data into EDS 
+
+        lendingbatch ->> lendingdb : Query Credit Limit Applications with status COMPLETED
+        lendingdb -->> lendingbatch : Credit Limit Applciations
+        loop For Each Credit Limit Application
+
+            lendingbatch ->> mule : Get Company Details: POST :v1/PartyIng 
+            note left of mule : PartyId : <irim>
+            mule -->> lendingbatch : Company Details Response
+
+            lendingbatch ->> lendingbatch : Extract TradeLicenseNumber, PrimaryPhoneNumber,<br> CompanyName, Registered Emirate Id
+
+            note over lendingbatch : Missing Emirate ID??
+
+            opt AECB personal consent = true
+                lendingbatch ->> mule : Get Personal Details: POST :v1/PartyIng 
+                note left of mule : PartyId : <personalRim>
+                mule -->> lendingbatch : Personal Details Response
+                lendingbatch ->> lendingbatch : Extract Full Name, Gender, DOB, Nationality - Country Code,<br> Emirates National Id, PassportNumber, PhoneNumber
+
+            end
+
+            loop For Each Credit Application File
+                lendingbatch ->> blob: Open Stream to Application File
+                blob -->> lendingbatch : Opened
+                lendingbatch ->> edm : Store Application File
+                edm -->> lendingbatch : Stored
+            end
+            
+        
+        end 
+        
+        lendingbatch ->> ot : Start Application Processing
+        note over ot : request: <br> Application ID, Application Files (ref to EDMS) - Personal Statement Files Company Statements, VAT Statements<br> Expected Credit Limit  <br>Application Type : [Credit Limit Increase, Credit Card Issuance]<br>Company Details - Mandatory (TradeLicenseNumber, PrimaryPhoneNumber,<br> CompanyName, Registered Emirate Id)<br> Personal Details - Optional (Full Name, Gender, DOB, Nationality - Country Code,<br> Emirates National Id, PassportNumber, PhoneNumber)
+        lendingbatch ->> lendingdb : Update Credit Line Application Status = PROCESSING
+        lendingdb -->> lendingbatch : Updated
+
+        note over ot : Processing Started
+        
+
+        note over mobile, edm : Listing lending
+
+        owner ->> mobile : Open lending List View
+        mobile ->> lending : List Owner lending
+        lending ->> lendinglisting : List lending
+
+        lendinglisting ->> lendingdb : Select Active lending For IRIM
+        lendingdb -->> lendinglisting : Query Result
+        lendinglisting -->> lending : List lending Result
+        
+        lending ->> lendingdb : Select Pending lending Issuance Application
+        lendingdb -->> lending : Pending lending Issuance Application
+
+        lending -->> mobile : List Owner lending Result
+        mobile -->> owner : Present lending List View
+
+    
+        %% https://www.figma.com/design/yOotMefSp1SvNg3DiqI5Jh/lending?node-id=5884-45532&t=G9pBHmkAPqakfttu-4
+
+    
+    
