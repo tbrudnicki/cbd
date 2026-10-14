@@ -1,6 +1,6 @@
 # ADR-0005: AI conversation phase — chat-orchestrator-service extraction and REST/text-event-stream integration
 
-Status: **resolved**
+Status: **open** — the transport decision in §3 is under architecture-forum discussion, see §10. §3 remains the **working assumption** the solution design is drawn against until the forum decides; §4–§7 are not in question.
 Relates to: [solution-design.md](./solution-design.md) §1.2/§1.4/§1.6/§2/§3, [conversational_banking_service_context.md](./conversational_banking_service_context.md), [ADR-0001](./adr-0001-realtime-transport.md), [ADR-0003](./adr-0003-reconciliation-job.md)
 Decision owner: TBD — needs a counterpart owner on whichever team builds `chat-orchestrator-service`, not just `smb-chat-service`'s team
 
@@ -15,6 +15,8 @@ This ADR covers moving the bot-first phase out of `smb-chat-service` entirely, o
 This ADR originally specified **asynchronous integration over Azure Service Bus** (two queues, `chat-ai-inbound`/`chat-ai-outbound`). That transport decision has been **superseded** — the final decision (§3 below) is a direct, synchronous REST call with a streamed (`text/event-stream`) response instead. Keeping this note rather than quietly rewriting history: the Service Bus design was fully worked through (queue topology, session-based ordering options, idempotency-key generalization, DLQ posture) before being replaced, not abandoned half-finished. Most of that work carries over unchanged (§5's idempotency-key generalization, the one-way `AI → HUMAN` rule, the C2 diagram shape) because those decisions didn't actually depend on which transport sat between the two services. What changed is narrower than it might look: §3 and the open items in §7.
 
 ## 3. Decision: two phases, AI delegated over synchronous REST with a streamed response
+
+> **Open — working assumption only.** The phase model and the router role below stand. The transport choice (direct REST + `text/event-stream`, no broker) is under forum discussion — see §10 for why, the alternatives, and the questions the forum needs to answer.
 
 - `Conversation.state` is renamed `FAQ` → **`AI`**. The two-phase model stays `AI → HUMAN → CLOSED`; only the first phase's name and implementation change.
 - `smb-chat-service` becomes a pure router/facade: no conversational logic of its own. Per message it branches on `Conversation.state` — `AI` calls `chat-orchestrator-service` directly, `HUMAN` forwards to D365 exactly as before.
@@ -64,4 +66,100 @@ A two-`Container_Boundary` layout (one per owning team: "Bank Chat Platform" vs.
 
 ## 9. Decision summary
 
-Proceed with: `AI`/`HUMAN`/`CLOSED` phase model (one-way `AI → HUMAN`); `smb-chat-service` as pure router; direct synchronous REST call to `chat-orchestrator-service` (`POST /converse`) with a `text/event-stream` response for long-running generation, no broker; `delta` chunks relayed live over Web PubSub, `done`/`escalate` driving the same persist-and-push or escalate logic as before; `activityId` generalized to `externalMessageId` (load-bearing dedupe for `HUMAN`, informational for `AI`); attachment access via facade-issued SAS URL in the request, no new C2 edge; single-boundary C2 shape with `chat-orchestrator-service` as an external-to-the-boundary `Container`. Nothing architecturally significant remains open (§8 is confirmation/operational work, not a design fork) — this ADR is closed.
+Proceed with: `AI`/`HUMAN`/`CLOSED` phase model (one-way `AI → HUMAN`); `smb-chat-service` as pure router; direct synchronous REST call to `chat-orchestrator-service` (`POST /converse`) with a `text/event-stream` response for long-running generation, no broker; `delta` chunks relayed live over Web PubSub, `done`/`escalate` driving the same persist-and-push or escalate logic as before; `activityId` generalized to `externalMessageId` (load-bearing dedupe for `HUMAN`, informational for `AI`); attachment access via facade-issued SAS URL in the request, no new C2 edge; single-boundary C2 shape with `chat-orchestrator-service` as an external-to-the-boundary `Container`. The transport choice (direct REST + `text/event-stream`) is the working assumption only and remains open for forum decision — see §10. Everything else in this summary stands.
+
+## 10. Open: transport for the `smb-chat-service` ↔ `chat-orchestrator-service` leg
+
+Status: **open — for architecture forum discussion.** Until the forum decides, §3 (REST + `text/event-stream`) remains the working assumption, and the solution design stays drawn against it so the document is coherent.
+
+### 10.1 Why this is open
+
+§3 replaced the original Service Bus design on the grounds that plain REST is "the more conventional shape … no broker to stand up, operate, or reason about." That reasoning never named **failure recovery** as a driver. Walking through what happens to a long-running generation when either service is redeployed or crashes shows that:
+
+- §3 as written has **no recovery path** — a dropped stream is a user-visible failure and the customer has to resend (solution-design.md scenario 2, "call fails or times out" branch).
+- Adding a recovery path to the synchronous design means building, by hand and split across two teams, the guarantees a message broker already provides: a durable request record, a durable result, redelivery, and dedupe.
+
+The question for the forum is therefore not "sync vs. async" in the abstract, but: **given that recovery from redeploys and crashes is a requirement, do we build those guarantees ourselves over HTTP, or take them from a broker?**
+
+### 10.2 Scope
+
+- **In question:** only the transport of §3, i.e. the `smb-chat-service` ↔ `chat-orchestrator-service` leg.
+- **Not in question:** the mobile ↔ `smb-chat-service` contract (202 Accepted + answer pushed over Web PubSub — unchanged under every option below), the phase model and one-way `AI → HUMAN` rule (§4), attachment access via SAS (§6).
+- **Affected by the outcome:** §5 — under any option that retries or redelivers, `externalMessageId` becomes a load-bearing dedupe key for `AI`-phase rows again, not informational. §7 — a broker option adds one container to the C2 diagram.
+
+### 10.3 Confirmed context (inputs to the decision)
+
+| # | Fact | Effect |
+|---|---|---|
+| C1 | The interaction is strict request/response: one prompt in, one answer out. The orchestrator never initiates a message and never sends several outputs for one input (per current Figma designs). | Async is not *forced* by the interaction shape — this is a choice on reliability grounds |
+| C2 | No transactional flows (SCA, payment execution, beneficiary changes) run through this chat's `AI` phase today. | If such flows are added later, the orchestrator will need to send messages nobody asked for (receipts, status updates) — request/response cannot carry these, which would strengthen the async case further |
+| C3 | **Requirement:** a lost connection or a dead replica on either side, including during a routine redeploy, must be detected and recovered **without the customer resending**. | Primary driver. Option 1 below does not meet it |
+
+### 10.4 Failure modes
+
+| | Failure | What is lost | §3 as written today |
+|---|---|---|---|
+| F1 | `chat-orchestrator-service` pod dies mid-generation (crash or redeploy) | The work — the answer never existed | Stream drops; nothing re-runs the work; customer must resend |
+| F2 | `smb-chat-service` pod dies mid-stream, orchestrator finishes | A finished answer nobody receives | Lost — and nothing even records that a reply is still owed, so the conversation silently goes quiet |
+| F3 | Connection drops between two live services (network, proxy idle timeout) | Either of the above — neither side knows which | Ambiguous; treated as a failure |
+
+### 10.5 Options
+
+**Option 1 — REST + SSE as in §3 (status quo).** Keeps live token streaming, no broker. Fails C3 on F1, F2 and F3. Listed for completeness; not viable if C3 stands.
+
+**Option 2 — REST + SSE with idempotent replay.** `smb-chat-service` calls `POST /converse` with a stable per-turn idempotency key (e.g. the prompt's `ConversationEvent` id). If the stream breaks, the orchestrator keeps generating and stores the result; a surviving or restarted `smb-chat-service` replica retries with the same key and receives the stored result instead of a fresh generation. Requires:
+
+- *Orchestrator team:* a shared (not pod-local) result store with TTL; generation decoupled from the HTTP connection (frameworks often cancel on client disconnect by default); request state `IN_PROGRESS` (owner + lease) → `DONE`/`FAILED`; defined retry behaviour per state (replay / reattach / regenerate on expired lease).
+- *`smb-chat-service`:* a durable "reply owed" record per `AI` turn (`AWAITING_REPLY`, attempts, deadline); a restart-safe sweeper that retries stale turns and finally surfaces a failure; dedupe on `externalMessageId`; a distributed lock or equivalent for per-conversation serialization (§8).
+- *Infrastructure:* long-lived-connection support and heartbeats on every intermediary (§8).
+
+**Option 3 — Azure Service Bus request/reply queues with sessions.** Essentially the original design this ADR started with (§2: `chat-ai-inbound` / `chat-ai-outbound`), with `sessionId = conversationId`. The platform supplies: redelivery on lock expiry (F1), a durable reply any facade replica can consume (F2), no held connection (F3 disappears), one in-flight turn per conversation (sessions), and load levelling so a slow orchestrator never ties up facade capacity that `HUMAN`-phase traffic shares. Still requires:
+
+- a **transactional outbox** in `smb-chat-service` (the prompt's SQL insert and the Service Bus send are not one transaction);
+- **dedupe on both sides** (at-least-once delivery): facade on `externalMessageId`, orchestrator on the turn key;
+- a **customer-visible deadline** (message TTL + dead-letter handling → failure state shown to the customer);
+- **DLQ monitoring** and an operational runbook;
+- **giving up live token streaming** — the customer sees a "thinking" state, then the whole answer.
+
+**Option 4 — Hybrid.** Option 3 for the durable request and final answer, plus a separate best-effort channel for live `delta` chunks. Keeps streaming, but brings back part of the connection-handling complexity Option 3 removes. Only worth it if streaming is a hard requirement *and* Option 2's cross-team commitment isn't available.
+
+### 10.6 Comparison
+
+| Driver | Option 1 | Option 2 | Option 3 | Option 4 |
+|---|---|---|---|---|
+| Recovers F1 (orchestrator dies) | ❌ | ✅ regenerate on expired lease | ✅ redelivery | ✅ redelivery |
+| Recovers F2 (facade dies) | ❌ | ✅ retry + replay | ✅ durable reply | ✅ durable reply |
+| F3 (connection drop) | ❌ | ✅ retry + replay / reattach | n/a — no held connection | Streaming channel only — deltas lost, answer safe |
+| Live token streaming | ✅ | ✅ | ❌ | ✅ |
+| Hand-built reliability mechanisms | none | many, across both teams | outbox, dedupe, DLQ handling (standard patterns) | Option 3's + a streaming channel |
+| Per-conversation serialization (§8) | distributed lock | distributed lock | Service Bus sessions | Service Bus sessions |
+| Slow orchestrator affects `HUMAN`-phase capacity | yes | yes | no — queue absorbs backlog | partly |
+| New infrastructure to operate | none | none (but connection-tuned intermediaries) | Service Bus | Service Bus + streaming path |
+| Orchestrator team commitment | low | high (result store, leases, replay API) | medium (queue consumer, dedupe) | medium-high |
+
+### 10.7 Preliminary recommendation
+
+**Option 3 (Service Bus with sessions)**, on condition that:
+
+1. live token streaming is **not** a hard product requirement (a "thinking" indicator followed by the full answer is acceptable), and
+2. Azure Service Bus is already an operated platform service at the bank, or is acceptable to introduce.
+
+Reasoning: given C1 (pure request/response) and C3 (recovery is required), Option 2 rebuilds a broker's guarantees by hand across two teams' codebases, while Option 3 reduces the custom work to well-known patterns (outbox, dedupe, DLQ) and also resolves §8's serialization and streaming-infrastructure items. If condition 1 fails, the choice is between Option 2 and Option 4. If condition 2 fails, Option 2.
+
+### 10.8 Questions for the forum
+
+1. **Streaming (decisive).** Is progressive token streaming a product/UX requirement in the Figma designs, or is a "thinking" indicator acceptable?
+2. **Platform (decisive).** Is Azure Service Bus an existing, operated platform service? If not, is introducing it acceptable for this integration?
+3. **Orchestrator team.** Do they prefer consuming a queue or exposing a streamed endpoint? Will they commit to their half of Option 2 (result store, leases, replay) if that's the outcome?
+4. **Regeneration.** When the orchestrator dies mid-generation (F1), every option regenerates the answer. Is that acceptable (LLM cost, a delay, possibly different wording)?
+5. **Orchestrator state.** Does the orchestrator store conversation turns itself, or is it stateless with the history sent per call? If it stores them, retries and redeliveries must be idempotent on its side under every option.
+6. **Latency.** Expected time to the full answer, typical and p99. Seconds favour Option 2; minutes strongly favour Option 3.
+7. **Decision owner.** Who owns this decision jointly on the `smb-chat-service` and `chat-orchestrator-service` sides (still TBD at the top of this ADR)?
+
+### 10.9 Solution design impact if Option 3 is adopted
+
+- C2 diagram: add a Service Bus container; the `smb-chat-service` ↔ `chat-orchestrator-service` relationship becomes two queue relationships.
+- Scenario 2 redrawn: outbox → request queue → orchestrator → reply queue → facade consumer → dedupe → persist → push. The `delta` loop is removed (or moves to the side channel under Option 4).
+- §1.6 "AI conversation" bullets rewritten; `externalMessageId` becomes load-bearing dedupe for `AI`-phase rows.
+- §4 open items: 10 (timeout/streaming infrastructure) and 13 (per-conversation serialization) are replaced by outbox, message TTL/deadline, and DLQ-handling items; item 11 becomes a "thinking" indicator only.
+- §8 of this ADR is replaced accordingly.
