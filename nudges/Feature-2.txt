@@ -1,0 +1,48 @@
+Enable newly onboarded SME customers to discover and adopt key Up by CBD capabilities through contextual, progress-based nudges across the app.
+The activation journey should prioritize essential actions, beginning with account funding, followed by payment initiation and relevant banking services. Nudges must be based on the customer’s onboarding status, product eligibility, completed actions, and current app context, rather than being displayed as generic promotions.
+
+
+Fund the account this is the nodge we need to create. I have created some initial flow of how we could establish live nps_feedback_submitted
+
+
+
+```
+sequenceDiagram
+autonumber
+Participant front as UP By CBD<br>Mobile App
+Participant nodge as Nodges Service 
+participant mw as Middleware
+
+Note over front: Admin Successfully logged in
+
+front ->> nodge: POST /nodges/dashboard
+
+opt User Role is Not OWNER
+    nodge -->> front : Return Empty Nodges
+end
+
+nodge ->> mw : Get Account For Irim GetAccountSummaryByIrim
+mw -->> nodge : Accounts for Irim
+
+loop For Each Customer Account
+    nodge ->> mw : Get Account Balance POST: /PartyAcctRelInq
+    mw -->> nodge : Account Balance
+
+    break Available Balance != 0
+        nodge -->> front : Return Empty Nodges
+    end
+
+    nodge ->> mw : Get Transaction History POST /SearchAccountTransactions[filter=CREDIT]
+    mw -->> nodge : Trasnsction History Results
+
+    break Transaction Histtory is NOT Empty
+        nodge -->> front : Return Empty Nodges
+    end
+end
+
+nodge -->> front : Return FUNDING nodge
+
+
+
+
+```

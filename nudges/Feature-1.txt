@@ -1,0 +1,157 @@
+Introduce a lightweight, non-intrusive Net Promoter Score (NPS) survey within the Up by CBD app to capture customer feedback after selected successful journeys and at configured periodic intervals.
+Customers who provide a score of 9–10 will be classified as promoters and invited to rate Up by CBD on the relevant app store. Customers who provide a score of 0–8 will be asked to provide additional feedback, which will be recorded internally for analysis and service improvement.
+Business Objective
+Measure customer satisfaction at relevant moments.
+Capture journey-specific feedback.
+Identify product and service improvement opportunities.
+Encourage promoters to provide public app-store ratings.
+Establish a configurable framework for future survey triggers.
+NPS Triggers
+Display the survey after successful completion of:
+Debit card activation
+Card limit increase, after the consent screen
+First International Transfer
+Third Local Transfer
+WPS enrolment
+Invoice creation
+Periodically, every three months
+The survey must not appear if the underlying journey is unsuccessful, pending, or interrupted.
+Customer Journey
+Step 1: NPS Rating
+Display the question:
+How likely are you to recommend Up by CBD to a friend or colleague?
+Provide:
+Rating scale from 0 to 10
+Skip or close option
+Clear rating selection state
+Continue or Submit CTA
+Step 2: Response-Based Journey
+Score 9–10: Promoter
+Save the rating internally.
+Display a positive acknowledgement.
+Invite the customer to rate Up by CBD.
+Redirect to the Apple App Store on iOS or Google Play Store on Android.
+Provide a Maybe Later option.
+Suggested message:
+Thank you for your feedback! We’d love for you to share your experience on the App Store.
+Score 0–8: Passive or Detractor
+Save the rating internally.
+Display a feedback form.
+Allow selection of one or more predefined reasons.
+Provide an optional free-text comments field.
+Do not redirect the customer to an app store.
+Suggested reasons:
+App performance
+Payments experience
+Account servicing
+Navigation
+Feature functionality
+Other
+Confirmation message:
+Your feedback has been recorded and will help us improve your experience.
+Periodic NPS Rules
+Display the periodic NPS survey every three months.
+Allow the customer to skip or dismiss the survey up to three times.
+Record each skip against the periodic survey cycle.
+After the third skip, suppress the periodic survey for three months.
+Reset the skip count when a new eligible periodic survey cycle begins.
+Transaction-triggered and periodic survey rules must prevent overlapping or repeated prompts within a configurable suppression period.
+Reporting Requirements
+A Power BI dashboard shall be created to monitor NPS performance and customer feedback for a rolling 60-day period.
+The dashboard shall include:
+Total surveys displayed, submitted, and skipped
+Survey response and completion rates
+NPS score and rating distribution from 0 to 10
+Promoter, passive, and detractor volumes and percentages
+Results by trigger journey, customer segment, device platform, and date
+Feedback reasons and comments for scores from 0 to 8
+App-store prompt and redirect volumes for scores of 9 and 10
+Submission, network, and app-store redirection failures
+Periodic-survey skip counts and suppression volumes
+Daily and weekly NPS trends
+Raw Data Export
+Power BI shall allow authorized users to export the underlying raw data for the selected reporting period.
+The default reporting period shall be the latest 60 days.
+Users shall be able to apply filters before exporting the data.
+The export shall include rating, feedback reason, comments, trigger journey, customer segment, device platform, event timestamps, app-store actions, skip count, and submission status.
+Customer identifiers shall be masked or access-controlled in line with the bank’s data-security and privacy requirements.
+Dashboard access, data export, and personally identifiable information visibility shall be controlled through role-based access.
+MoEngage Event Requirements
+The application shall capture and send the following events to MoEngage:
+nps_survey_displayed
+nps_survey_skipped
+nps_survey_dismissed
+nps_rating_selected
+nps_feedback_submitted
+nps_feedback_failed
+nps_app_store_prompt_displayed
+nps_app_store_redirect_clicked
+nps_app_store_redirect_failed
+nps_maybe_later_selected
+nps_periodic_survey_suppressed
+Common Event Attributes
+Each applicable event shall include:
+Customer ID or approved masked identifier
+Company ID
+Survey ID and survey version
+Trigger journey
+Trigger type: journey-based or periodic
+Rating selected
+Customer classification: promoter, passive, or detractor
+Feedback reasons selected
+Free-text comment indicator
+Skip count
+Suppression status and expiry date
+Device platform and operating-system version
+Application version
+Event timestamp
+Submission or failure status
+Error code, where applicable
+Feedback comments containing customer-entered text should only be sent to MoEngage where approved by Information Security, Compliance, and Data Privacy; otherwise, only the comment-submitted indicator and internal feedback reference should be captured.
+
+
+Key Configuration Requirements
+The backend or middleware should support configuration of:
+Eligible journeys and trigger events
+First or nth transaction rules
+Periodic survey frequency
+Skip limit and suppression period
+Promoter threshold
+Feedback reasons
+Free-text field availability and character limit
+Survey and confirmation copy
+Apple App Store and Google Play Store URLs
+Journey-level cooling-off period
+Feature-level enablement or disablement
+Customer and segment eligibility
+
+High-Level Acceptance Criteria
+AC1: Journey-Based Trigger
+The NPS survey shall be displayed only after successful completion of a configured eligible journey.
+AC2: Periodic Trigger
+The periodic NPS survey shall be presented every three months, subject to configured eligibility, skip, and suppression rules.
+AC3: Rating Capture
+The customer shall be able to select and submit one score from 0 to 10, with the selected rating clearly highlighted.
+AC4: Promoter Journey
+A customer who submits a score of 9 or 10 shall receive an app-store review prompt with Rate the App and Maybe Later options.
+AC5: App-Store Redirection
+Selecting Rate the App shall open the Apple App Store on iOS or Google Play Store on Android using the configured store URL.
+AC6: Feedback Journey
+A customer who submits a score from 0 to 8 shall be shown configurable feedback reasons and an optional comments field without being redirected to an app store.
+AC7: Feedback Storage
+The submitted rating, feedback reason, comments, journey, customer identifier, device platform, and submission timestamp shall be recorded internally.
+AC8: Skip Handling
+Each periodic survey dismissal shall increment the skip count, and the survey shall be suppressed for three months after the third skip.
+AC9: Submission Confirmation
+A confirmation message shall be displayed after the customer’s feedback is successfully recorded.
+AC10: Error Handling
+If feedback submission fails, the app shall display “We couldn’t submit your feedback right now. Please try again later.” with Retry and Close options.
+AC11: Redirection Failure
+If the app store cannot be opened, the app shall display “Unable to open the App Store at the moment.”
+AC12: Configuration
+Survey triggers, frequency, rating thresholds, suppression periods, skip limits, feedback reasons, content, and app-store URLs shall be backend configurable without an app release.
+AC13: Power BI shall provide NPS reporting for a rolling 60-day period with filters for date, trigger journey, rating category, customer segment, and device platform.
+AC14: Authorized Power BI users shall be able to export the filtered underlying raw data, subject to role-based access and data-masking controls.
+AC15: Relevant NPS interaction, submission, skip, redirect, suppression, and failure events shall be captured in MoEngage with the defined event attributes.
+AC16: Power BI data and MoEngage events shall reconcile with the source NPS submissions using a common survey or feedback reference.
+AC17: Dashboard refresh frequency, reporting dimensions, event names, event attributes, and data-retention rules shall be configurable without requiring an app release.
