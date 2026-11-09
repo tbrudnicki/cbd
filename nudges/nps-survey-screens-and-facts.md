@@ -1,7 +1,6 @@
 # 1. Introduction
 
-This document covers the `nps_survey` nudge: the Feature-1 NPS survey, modeled as a single nudge within the **nudge sub-service** of `customer-management-service` (Kevlar). It is scoped to one question only — **which screens must carry the nudge, and which facts decide whether it is eligible on each of them.** Reporting (Power BI) and the MoEngage event stream the app itself emits are out of scope here; see `Feature-1.txt` for those.
-
+This document covers the `nps_survey` nudge: the Feature-1 NPS survey, modeled as a single nudge within the **nudge sub-service** of `customer-management-service` (Kevlar). It is scoped to one question only — **which screens must carry the nudge, and which facts decide whether it is eligible on each of them.** Reporting (Power BI) and the MoEngage event stream the app itself emits are out of scope here
 **Ownership.**
 
 | Area | Owner |

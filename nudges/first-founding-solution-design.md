@@ -20,7 +20,7 @@ The nudge sub-service remains the **only writer** of nudge state (`CUSTOMER_NUDG
 
 ## C2 diagram container diagram
 
-```mermaid
+::: mermaid
 flowchart LR
   APP["UP by CBD<br>Mobile App"] -->|"GET /v1/nudges?screen=home"| API
   subgraph NS["Nudge sub-service (customer-management-service)"]
@@ -33,7 +33,7 @@ flowchart LR
   RULE -->|"facts.live (cache miss / stale)"| MW["Middleware<br>(core banking facade)"]
   DWH[("Data warehouse, T-1")] -->|"daily load"| FACT
   MW -->|"GetAccountSummaryByIrim,<br>PartyAcctRelInq,<br>SearchAccountTransactions"| CB[Core banking]
-```
+:::
 
 Nothing new is added to the shared instance or schemas described in `nudges-model.md` §3–4: this feature is one rule class (`FirstFundingRule`) plus its live-lookup implementation against existing middleware endpoints.
 
@@ -123,6 +123,8 @@ _(link to figma — TBD)_
 Scope for this iteration: the `first_funding` nudge on the `home` screen only, shown to OWNER-role users of a newly onboarded company with no funded account. Payment-initiation and other activation nudges referenced in the feature description are out of scope here and will get their own placements/rules later, reusing the same engine.
 
 ## Backlog
+
+_(link to backlog — TBD)_
 
 ### Features
 
