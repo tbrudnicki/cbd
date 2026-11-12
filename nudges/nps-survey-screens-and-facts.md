@@ -1,16 +1,20 @@
 # 1. Introduction
 
-This document covers the `nps_survey` nudge: the Feature-1 NPS survey, modeled as a single nudge within the **nudge sub-service** of `customer-management-service` (Kevlar). It is scoped to one question only — **which screens must carry the nudge, and which facts decide whether it is eligible on each of them.** Reporting (Power BI) and the MoEngage event stream the app itself emits are out of scope here
+This document covers the `nps_survey` nudge: the Feature-1 NPS survey. **The signal to display the survey comes from MoEngage**, using the same Self-Handled In-App pattern as `First-founding-moengage-sdk-delivery-solution-design.md`. `customer-management-service` (Kevlar) keeps exactly two jobs: feeding MoEngage what it needs to target correctly, and storing the submitted result. It is scoped to one question only — **which screens must carry the survey, and what customer-mgmt-service and the data platform must feed MoEngage so its targeting makes the right call on each one.** Reporting (Power BI) is out of scope here.
+
+**Why this is a smaller lift than `first_funding`'s hybrid.** `first_funding` needed a live backend check before every render because a stale "unfunded" signal would show a nudge that's flatly wrong (and costs a wasted middleware round-trip to boot). A stale NPS-survey trigger has no equivalent failure mode — at worst it asks someone slightly too early, too often, or on the wrong screen, all recoverable by a human closing the sheet. That's why this design has no live eligibility check in the render path: MoEngage's own targeting is trusted as the whole decision, not just a coarse pre-filter.
+
 **Ownership.**
 
 | Area | Owner |
 |---|---|
-| Nudge decision (`nps_survey` eligibility, lifecycle) | Nudge sub-service, `customer-management-service` |
-| Customer facts (`CUSTOMER_FACT`: counters, `first_invoice_at`) | Data platform |
-| Live facts (`CUSTOMER_LIVE_FACT`: NPS result, live lookups) | Nudge sub-service |
-| Presentation (rating UI, feedback form, app-store redirect) | Mobile app |
+| Whether to *offer* the survey at all (targeting, periodic schedule, per-campaign frequency cap/minimum delay, "already responded" exclusion) | MoEngage, evaluated server-side, cached on-device by the SDK (see `first_funding`'s Decisions item 2 for the cache-cadence caveat — applies identically here) |
+| Firing `International Transfer Completed`/`Local Transfer Completed` events on every outgoing transfer, so MoEngage's own segmentation does the threshold gating | Mobile app |
+| Rendering the survey UI, reporting shown/clicked/dismissed directly to MoEngage — `customer-management-service` is not in this path at all | Mobile app |
+| Storing the submitted result (`customer_id`, `score`, `submitted_at`) — the **only** thing `customer-management-service` does for this feature | `customer-management-service` (nudge sub-service), in `customer-mgmt-db` |
+| Pushing the result back into MoEngage as a customer attribute, so targeting can exclude recent responders | `customer-management-service` |
 
-Companion to `nudges-model.md` §7 (use cases) — the general data model, lifecycle engine, and API are defined there; this document applies them to the NPS feature.
+Companion to `First-founding-moengage-sdk-delivery-solution-design.md`, which this document follows for the delivery pattern.
 
 # 2. Architecture
 
@@ -18,155 +22,112 @@ Companion to `nudges-model.md` §7 (use cases) — the general data model, lifec
 
 ::: mermaid
 flowchart LR
-  FRONT[SME Mobile Application<br/>Up by CBD]
-
-  subgraph CMS["Customer Management Service — Kevlar"]
-    API[Nudge sub-service API<br/>+ lifecycle engine + rules]
+  subgraph MOBILE["UP by CBD Mobile App"]
+    SCR["Screen onResume()<br>(any of the 7 placements)"]
+    XFER["Outgoing transfer completes<br>(international/local)"]
+    CB_APP["onSelfHandledAvailable(payload)"]
+    RENDER["Render survey UI"]
   end
 
-  subgraph DB["Customer Management DB — shared instance"]
-    MART[("nudge_mart schema<br/>CUSTOMER_FACT")]
-    NSCHEMA[("nudge schema<br/>NUDGE, CUSTOMER_LIVE_FACT,<br/>CUSTOMER_NUDGE, CUSTOMER_NUDGE_HISTORY")]
-  end
-
-  subgraph DP["Data Platform"]
-    ETL[ETL pipeline]
-    STREAM[Stream ingestion]
-  end
-
-  CB[Core Banking]
+  SDK["MoEngage SDK"]
   MOE[MoEngage]
-  DS[Downstream APIs<br/>accounts, profile]
 
-  FRONT -->|"GET /v1/nudges<br/>POST outcomes, nps-responses"| API
-  API --> NSCHEMA
-  API -. read-only .-> MART
-  API -->|live lookup, request time| DS
-  CB --> ETL
-  FRONT -->|app events| MOE
-  MOE --> STREAM
-  ETL -->|daily, T-1| MART
-  STREAM -->|near real time| MART
+  subgraph CMS["customer-management-service"]
+    API["POST /v1/nps-responses<br>(storage only)"]
+  end
+
+  subgraph DB["customer-mgmt-db"]
+    LF[("nps.last_response_at<br>nps.last_score")]
+  end
+
+  SCR -->|"setInAppContext([screen])<br>+ getSelfHandledInApp()"| SDK
+  XFER -->|"trackEvent: International/Local<br>Transfer Completed"| SDK
+  SDK -->|"targeting: role + context<br>+ event/attribute filters + frequency cap"| MOE
+  MOE -->|"payload, if offered"| SDK --> CB_APP
+  CB_APP --> RENDER
+  RENDER -->|"selfHandledShown/Clicked/Dismissed<br>(shown, success, skip, dismiss — all of it)"| SDK --> MOE
+  RENDER -->|"POST /v1/nps-responses<br>{ customer_id, screen, score, submitted_at }<br>(only on actual submission)"| API
+  API --> LF
+  API -->|"POST /v1/customer —<br>nps.last_score, nps.last_response_at"| MOE
 :::
+
+`customer-management-service` has exactly **one** inbound call for this feature: `POST /v1/nps-responses`, fired only when the user actually submits a score. Shown/clicked/dismissed/skipped all go straight from the mobile app to the MoEngage SDK — `customer-management-service` never sees them, and isn't consulted before rendering either way.
 
 ## Sequence diagram
 
-One `GET /v1/nudges?screen=...` call, evaluating only `nps_survey`, following `nudges-model.md` §5.1's order exactly.
+**Path A — MoEngage offers, app renders, result or outcome flows back.**
 
 ::: mermaid
 sequenceDiagram
 autonumber
-participant front as SME Mobile Application
-box Customer Management Service
-    participant api as Nudge Sub-service API
-    participant engine as Lifecycle Engine
-    participant rule as NpsSurveyRule
-end
-box Customer Management DB
-    participant cfg as NUDGE / NUDGE_PLACEMENT
-    participant state as CUSTOMER_NUDGE
-    participant cf as CUSTOMER_FACT
-    participant lf as CUSTOMER_LIVE_FACT
-end
-participant ds as Downstream API
+participant front as Mobile App
+participant sdk as MoEngage SDK
+participant moe as MoEngage
+participant api as customer-management-service
+participant db as customer-mgmt-db
 
-Note left of front: Request nudges for a screen
-front ->> api: GET /v1/nudges?screen=local_transfer_confirmation
-api ->> cfg: active nudges placed on this screen
-cfg -->> api: [nps_survey, ...]
+Note left of front: Screen resumes (any of the 7 placements)
+front ->> sdk: setInAppContext([screen_name])
+front ->> sdk: getSelfHandledInApp()
+Note right of sdk: local eligible-campaigns cache,<br>refreshed at most once every 15 min per active session<br>(same mechanic as first_funding's Decisions item 2)
 
-Note left of front: Config and state check
-api ->> engine: evaluate(customer, nps_survey, now)
-engine ->> cfg: nps_survey.is_active? rule class registered?
-cfg -->> engine: yes
-engine ->> state: get CUSTOMER_NUDGE(customer, nps_survey)
-state -->> engine: row (status, valid_until, attempt_count, last_shown_at)
+alt offered
+    sdk -->> front: onSelfHandledAvailable(payload)
+    front ->> front: render survey UI
+    front ->> sdk: selfHandledShown(payload)
+    sdk ->> moe: report impression — counts against MoEngage's own frequency cap
 
-alt row.status is terminal
-    engine -->> api: return row — not served
-else row.status == ELIGIBLE and valid_until > now
-    engine -->> api: return row — cached decision, still servable
-else row.status == PARKED and valid_until > now
-    engine -->> api: return row — suppressed (3rd skip, cooling down)
-else
-    opt row.status == PARKED and valid_until <= now
-        engine ->> state: attempt_count = 0 — pause is over
+    alt user submits a score
+        front ->> sdk: selfHandledClicked(payload)
+        sdk ->> moe: report click
+        front ->> api: POST /v1/nps-responses<br>{ customer_id, screen, score, submitted_at }<br>(the only call this flow ever makes to customer-management-service)
+        api ->> db: upsert nps.last_response_at, nps.last_score
+        api ->> moe: POST /v1/customer — nps.last_score, nps.last_response_at
+    else user skips or dismisses
+        front ->> sdk: selfHandledDismissed(payload)
+        sdk ->> moe: report dismissal — counts against MoEngage's own frequency cap.<br>customer-management-service is never called, so no backend-side<br>skip count exists (see Decisions item 3)
     end
-    alt min_interval set and last_shown_at > now - min_interval
-        engine -->> api: NOT_ELIGIBLE — asked too recently
-    else
-        Note left of front: Fact evaluation
-        engine ->> rule: evaluate(facts, state, now)
-        rule ->> cf: get international_transfer_count, local_transfer_count, first_invoice_at
-        cf -->> rule: values + as_of
-        rule ->> lf: get nps.last_response_at, nps.last_score
-        lf -->> rule: values, or missing
-        opt same-day firing needed and dwh count is stale
-            rule ->> ds: live lookup (accounts API)
-            ds -->> rule: current count
-            rule ->> lf: facts.live(...) stores the result
-        end
-        rule -->> engine: Decision — Eligible / NotEligible / Park / ...
-        engine ->> state: apply decision — status, valid_until, attempt_count
-        engine ->> state: write CUSTOMER_NUDGE_HISTORY (reason, facts_used)
-        engine -->> api: updated row
-    end
+else not offered (targeting or MoEngage's own frequency cap excluded)
+    sdk -->> front: (no callback fires)
 end
 
-Note left of front: Response
-alt row is servable
-    api -->> front: { "nudges": [{ "name": "nps_survey" }] }
-else not servable
-    api -->> front: { "nudges": [] }
-end
+Note left of front: Screen stops
+front ->> sdk: resetInAppContext()
 :::
 
-Two things this makes visible that are easy to miss reading prose alone:
-- The **suppressed** branch (3rd skip, `PARKED`) never reaches the rule or the facts at all — it short-circuits on `CUSTOMER_NUDGE` state alone, confirming that suppression isn't fact-driven.
-- The live lookup is the *only* optional step — everything else runs on every request; it only fires when the rule decides a `dwh` counter might be too stale to trust for a same-day trigger.
+International and local transfers are outgoing payments triggered from the mobile app, so there's no second path for them: the app fires `International Transfer Completed`/`Local Transfer Completed` directly to MoEngage the moment a transfer completes (see the C2 diagram), and MoEngage's own segmentation — "has executed this event at least N times" — does the threshold gating with no backend involvement at all. Invoice creation doesn't have this guarantee yet; see Decisions item 2 for what's still open there.
 
 # 3. Design & Implementation
 
 ## User Journey
 
-_(link to Figma — not yet available)_. Interim reference: `Feature-1.txt` lines 19–51 describe the two-step journey (rating capture, then the promoter/detractor-specific branch) that the mobile app owns; this document only covers the backend decision that precedes it.
+_(link to Figma — not yet available)_. Interim reference: `Feature-1.txt` lines 19–51 describe the two-step journey (rating capture, then the promoter/detractor-specific branch) that the mobile app owns; this document only covers how the opportunity to show it reaches the app and what happens to the result.
 
-## Screens and facts
+## Screens and MoEngage triggers
 
-**Design choice.** One `NUDGE` row, `nps_survey`, placed on all seven screens below. Per `nudges-model.md` principle #8 (state is per customer and nudge, not per screen), this gives shared skip/suppression state across every trigger for free — which is what Feature-1 line 58 ("transaction-triggered and periodic rules must prevent overlapping or repeated prompts") asks for, without extra engine work.
+**Design choice.** Each screen below is a distinct **context** for `setInAppContext()`/`getSelfHandledInApp()` — following `first_funding`'s Decisions item 3 (context is the screen, not the nudge). `customer-management-service` only ever learns about an actual submission, never a shown/skip/dismiss, so it has nothing to track and nothing to push beyond "has this customer already responded." Cross-screen repeat-prompt control is entirely MoEngage's own frequency capping and per-campaign delivery controls — see Decisions item 3 for the limits of that.
 
-**Screens to support (`NUDGE_PLACEMENT`).**
-
-| Screen | Trigger journey | Trigger type | What gates eligibility |
+| Screen | Trigger journey | MoEngage trigger mechanism | What feeds MoEngage |
 |---|---|---|---|
-| `debit_card_activation_confirmation` | Debit card activation | journey | Placement only — reaching the screen implies success (same pattern as `csat_survey`, §7.2) |
-| `card_limit_increase_confirmation` | Card limit increase, post-consent | journey | Placement only |
-| `international_transfer_confirmation` | First international transfer | journey | Needs `international_transfer_count` — see below |
-| `local_transfer_confirmation` | Third local transfer | journey | Needs `local_transfer_count` — see below |
-| `wps_enrolment_confirmation` | WPS enrolment | journey | Placement only — reaching the screen is assumed to indicate success |
-| `invoice_creation_confirmation` | Invoice creation | journey | Placement only, **or** reuse `first_invoice_at` if the intended trigger is "first invoice ever" — see Decisions |
-| `home` | Periodic, every 3 months | periodic | Uses `CUSTOMER_NUDGE.last_shown_at` / `nps.last_response_at`; no new data-platform fact |
+| `debit_card_activation_confirmation` | Debit card activation | Event-triggered campaign on "Debit Card Activated" | Backend/data platform fires this event when activation happens |
+| `card_limit_increase_confirmation` | Card limit increase, post-consent | Event-triggered campaign on "Card Limit Increased" | Same pattern |
+| `international_transfer_confirmation` | First international transfer | Event-triggered campaign on "International Transfer Completed", audience filter "has executed this event at least 1 time" | Mobile app fires this via `trackEvent()` the moment the transfer completes |
+| `local_transfer_confirmation` | Third local transfer | Event-triggered campaign on "Local Transfer Completed", audience filter "has executed this event at least 3 times" | Same mechanism; MoEngage's own occurrence count does the threshold check |
+| `wps_enrolment_confirmation` | WPS enrolment | Event-triggered campaign on "WPS Enrolled" | Backend/data platform fires this event on enrolment |
+| `invoice_creation_confirmation` | Invoice creation | Event-triggered campaign on "Invoice Created" (or "First Invoice Created" — see Decisions item 1) | Backend/data platform fires this event on (first) invoice creation — exact sourcing still open, see Decisions item 2 |
+| `home` | Periodic, every 3 months | MoEngage's native periodic/recurring campaign type, context = `home_screen` | Nothing — periodicity is configured directly in MoEngage |
 
-**Facts required.** Working assumption (per `nudges-model.md` §3–4.1): data platform output (ETL/`dwh` and stream/`moengage_stream`) lands in `CUSTOMER_FACT`. Anything the nudge sub-service detects itself while handling a request — live lookups and app-submitted results — lands in `CUSTOMER_LIVE_FACT`.
+Every campaign above, regardless of trigger type, must additionally target on `role == OWNER` (or whatever role Feature-1 requires) and exclude customers where `nps.last_score`/`nps.last_response_at` is already set — i.e. already responded. That's the only exclusion customer-mgmt-service feeds in; any within-campaign repeat-prompt control (how many times, how far apart) is configured directly on each MoEngage campaign's own delivery controls — see Decisions item 3 and item 5.
 
-| `fact_key` | `owner` | `source` | `kind` | Lands in | Why |
-|---|---|---|---|---|---|
-| `international_transfer_count` | `data_platform` | `dwh` | `snapshot` | `CUSTOMER_FACT` | Running count of international transfers; the rule compares it against the configured nth-transaction threshold (Feature-1 line 116) instead of checking a single once-fact |
-| `local_transfer_count` | `data_platform` | `dwh` | `snapshot` | `CUSTOMER_FACT` | Running count of local transfers |
-| `first_invoice_at` | `data_platform` | `dwh` | `once` | `CUSTOMER_FACT` | Already exists in the model (§4.1, used by `try_invoicing`) — reuse rather than redefine, if "invoice creation" means first invoice |
-| `nps.last_response_at` | `nudge_sub_service` | `app` | `snapshot` | `CUSTOMER_LIVE_FACT` | Written synchronously when the app posts the NPS result — mirrors `csat.last_response_at` (§4.1, §5.3) |
-| `nps.last_score` | `nudge_sub_service` | `app` | `snapshot` | `CUSTOMER_LIVE_FACT` | Written synchronously, same call |
-| transfer count via live lookup (international/local) | `nudge_sub_service` | `live_lookup` | — | `CUSTOMER_LIVE_FACT` | Fallback only — fixes `dwh`'s T-1 lag for same-day firing |
+**Attributes/events feeding into MoEngage.**
 
-**Rule shape for the two counter-based triggers.** Fire on `count >= threshold`, not `count == threshold`. A plain equality check breaks the moment two transfers land in the same T-1 cycle — the count can jump straight from 0 to 2, skipping the exact value 1 (or 2 to 4, skipping 3) entirely. `>=` still catches it the first time the count reaches or passes the threshold.
+| Name | Kind | Source | Purpose |
+|---|---|---|---|
+| `nps.last_score`, `nps.last_response_at` | Customer attribute | `customer-management-service`, written synchronously on `POST /v1/nps-responses` | Still the system of record is `customer-mgmt-db` (per the earlier discussion in this conversation — MoEngage attribute writes are asynchronous and there's no sync read-back API suited to this); pushed to MoEngage **write-only** so targeting can exclude customers who already responded |
+| `International Transfer Completed`, `Local Transfer Completed` | Event | Mobile app, via `trackEvent()` on every completed outgoing transfer | Drives the two transfer-triggered campaigns; MoEngage's own occurrence-count segmentation does the threshold gating, no backend counting needed |
+| `Debit Card Activated`, `Card Limit Increased`, `WPS Enrolled`, `Invoice Created` | Event | Backend/data platform, fired on occurrence | Drives the placement-only campaigns |
 
-**Why no per-trigger "already prompted" fact is needed.** `nps_survey` is one nudge with one shared decision, skip budget, and suppression window across every trigger — journey or periodic. `>=` makes the counter conditions permanently true once reached, but that's fine: the engine's existing `min_interval` (§4.3, §5.1) already blocks re-asking before it elapses, and repeated skips already drive the shared `attempt_count` to `PARKED` for the configured suppression period (§5.2), regardless of which trigger caused each skip. A third local transfer, a WPS enrolment, and the periodic clock are just three different ways of making the same one decision eligible — they don't need separate bookkeeping, and adding it would fragment a skip budget that Feature-1 (line 58) explicitly wants unified.
-
-**No fact needed** — placement alone decides it, following §7.2's rule ("reaching the screen means the action has just happened"), extended to every journey trigger whose success can't be told apart from a pending or interrupted attempt purely by other means — accepted as a uniform assumption:
-- Debit card activation
-- Card limit increase, post-consent
-- WPS enrolment
-- Invoice creation, if every creation (not just the first) should trigger the survey
+**Rule shape for the two transfer-triggered campaigns.** Each campaign's audience filter uses MoEngage's event-occurrence operator — `atleast`, not `exactly` — so a user who racks up several transfers in quick succession still qualifies once they cross the threshold, with no risk of skipping past the exact count. This is evaluated entirely inside MoEngage; nothing on the backend counts transfers.
 
 ## Backlog
 
@@ -174,24 +135,71 @@ _(Provide the feature backlog)_
 
 ### Features
 
-#TBD — add the Jira/ADO ticket(s) covering `nps_survey` (eligibility, lifecycle, fact definitions)
+#TBD — add the Jira/ADO ticket(s) covering `nps_survey` (MoEngage campaign configuration per screen, mobile-app transfer-completion tracking, response storage)
 
 ### Decisions
 
 _(Provide decision link — until a formal decision log exists, tracked here)_
 
-1. **Invoice creation: first-ever, or every invoice?** Changes whether this trigger needs `first_invoice_at` or just placement. Feature-1 states it without an ordinal qualifier, unlike the transfer triggers, so this needs confirming rather than assuming.
-2. **Are international/local transfers app-exclusive for this product?** If customers can also transfer via another channel, `dwh` must stay authoritative for the counters; if app-only, `moengage_stream` could carry them near-real-time instead, removing the live-lookup fallback entirely.
-3. **`moengage_stream` end-to-end latency** (already open decision #9 in `nudges-model.md`) — needed before deciding whether stream facts are fast enough for any of the above same-day firings.
-4. **`min_interval` for `nps_survey`** (same open point as `nudges-model.md` open decision #5, now load-bearing here too). Since the transfer-count conditions stay permanently true once reached, `min_interval` is what stops every subsequent qualifying screen visit from re-asking before the configured suppression period (Feature-1 line 58) has passed — it needs an actual value, not `none`.
+1. **Invoice creation: first-ever, or every invoice?** Decides whether the "Invoice Created" event should be filtered to the first occurrence only (data-platform-side) or fired on every invoice (letting MoEngage's campaign fire every time, subject to the "already responded" exclusion and the campaign's own frequency cap/minimum delay).
+2. **How does "Invoice Created" actually get fired?** Unlike the two transfer triggers, invoice creation isn't confirmed as something the mobile app can fire directly the moment it happens — whatever creates the invoice (presumably a backend invoicing service) would need to know synchronously whether it's that customer's first-ever invoice, firing the event itself the same way the mobile app now does for transfers. If that's not available, this still needs a batch (T-1) or stream-sourced detection step feeding MoEngage instead, with the usual one-day-lag tradeoff attached to the batch option.
+3. **The 3-skip-then-park suppression policy (Feature-1 line 58's "prevent overlapping or repeated prompts") is not replicated here.** Shown/clicked/dismissed/skipped are reported by the mobile app straight to the MoEngage SDK; `customer-management-service` is never called for any of them, so it has no skip count to track and nothing to push beyond "has already responded." The only remaining repeat-prompt control is MoEngage's own per-campaign frequency cap, which is **device-level, not customer-level** (confirmed in `first_funding`'s research) — so a multi-device OWNER who dismisses on one device can still be re-offered on another, and there is no customer-level "N skips, then pause" behavior at all, only "at most N shows per device per period." Confirm this gap is acceptable before launch; if not, the only fix is routing outcome events back through `customer-management-service`, which means building a suppression tracker there after all.
+4. **Attribute push latency.** MoEngage's own docs confirm customer attribute writes are processed asynchronously with no guaranteed freshness window. A user who just submitted a response could, in principle, still be re-offered the survey on a near-simultaneous second screen visit before `nps.last_response_at` propagates. Low-stakes here (unlike `first_funding`'s equivalent risk) — worst case is one redundant prompt, not an incorrect financial decision — but worth confirming is acceptable rather than assumed.
+5. **`min_interval` value.** Configured directly on each campaign's MoEngage delivery controls ("add a minimum delay between two messages of this campaign"; confirmed available for the Self-Handled template type, unlike MoEngage's separate "Nudges" template type where that setting is disabled). Still device-level, same caveat as Decisions item 3; still needs an actual number, not `none`.
+6. **Does `customer_id` for this feature match the identifier MoEngage already uses elsewhere?** The payload in §API definition assumes `customer_id` is whatever identifier `customer-management-service` already uses to address the customer in MoEngage (see `first_funding`'s Decisions item 9 on `company_rim`/`personal_rim` — not re-litigated here, but the same identifier choice must apply to keep `nps.last_score` etc. attached to the same MoEngage profile the campaigns target).
 
 ### Tests
 
-_(Provide tests link — not yet created)_. Per `nudges-model.md` §4.3 guideline 3, `NpsSurveyRule` needs unit tests built from fact fixtures, for example: "no counters at threshold, no recent response → `NotEligible`"; "`local_transfer_count = 3`, no prior prompt → `Eligible`"; "`csat`-style `nps.last_response_at` within 3 months → `Park`".
+_(Provide tests link — not yet created)_
+
+- MoEngage offers on `local_transfer_confirmation` (3rd-transfer event already received, not frequency-capped) → `onSelfHandledAvailable` fires, app renders.
+- MoEngage does not offer (`nps.last_response_at` already set, or frequency capped) → no callback fires, `customer-management-service` is never called.
+- User submits a score → `POST /v1/nps-responses` is the only call made to `customer-management-service`; it stores `customer_id`, `score`, `submitted_at`, and `nps.last_score`/`nps.last_response_at` are pushed to MoEngage.
+- User skips or dismisses → `selfHandledDismissed` is reported to the MoEngage SDK only; `customer-management-service` receives no call and its DB is unchanged.
+- User dismisses the survey repeatedly across different screens on the same device → MoEngage's own frequency cap eventually stops offering it on that device; confirm this is accepted in place of a customer-level skip budget (Decisions item 3).
+- User completes their 1st international transfer → mobile app fires `International Transfer Completed` via `trackEvent()`; MoEngage's "at least 1 time" segmentation now matches, so `international_transfer_confirmation`'s campaign becomes eligible.
+- User completes their 2nd local transfer → `trackEvent()` fires, but MoEngage's "at least 3 times" segmentation still doesn't match — campaign stays ineligible.
+- User completes their 3rd local transfer → segmentation now matches; the campaign becomes eligible on the next visit to `local_transfer_confirmation`.
+- Race: user responds on one device while a second device is mid-render of the same campaign → acceptable per Decisions item 4; confirm the second device's render doesn't itself error, only potentially duplicates the prompt.
 
 ## API definition
 
-_(link to Swagger — not yet published)_. Relevant endpoints, defined in `nudges-model.md` §6:
-- `GET /v1/nudges?screen={screenName}` — existing, unchanged
-- `POST /v1/nudges/outcomes` — existing, unchanged (`shown` / `skipped` / `dismissed` for `nps_survey`)
-- `POST /v1/nps-responses` — new, same shape as `POST /v1/csat-responses` (§6.3): `response_id`, `screen`, `score`, `submitted_at`; stores `nps.last_response_at` / `nps.last_score` as live facts and forces re-evaluation
+_(link to Swagger — not yet published)_
+
+**`customer-management-service`'s only inbound call for this feature:**
+- `POST /v1/nps-responses` — `customer_id` is required in the payload alongside the score, so the result can be stored against the right customer:
+
+```json
+{
+  "customer_id": "99812345",
+  "screen": "local_transfer_confirmation",
+  "score": 9,
+  "submitted_at": "2026-11-12T10:15:00Z"
+}
+```
+
+Stores `nps.last_response_at`/`nps.last_score` in `customer-mgmt-db` (system of record — not MoEngage, per the write-only rationale in §1). Nothing else is tracked server-side for this feature.
+
+**`customer-management-service` → MoEngage attribute push**, same shape and endpoint as `first_funding`'s customer-attribute call:
+
+```
+POST https://api-0X.moengage.com/v1/customer/{{appId}}?app_id={{appId}}
+```
+```json
+{
+  "type": "customer",
+  "customer_id": "99812345",
+  "attributes": {
+    "nps_last_score": 9,
+    "nps_last_response_at": "2026-11-12T10:15:00Z"
+  }
+}
+```
+
+**Mobile → MoEngage SDK calls:**
+
+- `trackEvent("International Transfer Completed", { ... })` / `trackEvent("Local Transfer Completed", { ... })` — called by the mobile app the moment an outgoing transfer completes, independent of any of the 7 placement screens. MoEngage's own segmentation gates `international_transfer_confirmation`'s and `local_transfer_confirmation`'s campaigns on this event's occurrence count (`atleast 1` / `atleast 3`) — see §3's rule-shape note. No backend call involved.
+- `setInAppContext([screen_name])` then `getSelfHandledInApp()` — called from each placement screen's `onResume()`.
+- `onSelfHandledAvailable(payload)` — callback; triggers rendering directly, with no backend call in between (contrast with `first_funding`, where this callback triggers a live check instead).
+- `selfHandledShown(payload)` / `selfHandledClicked(payload)` / `selfHandledDismissed(payload)` — reported to MoEngage on every render, regardless of outcome. This is the **only** place shown/clicked/dismissed/skipped are recorded — there is no equivalent backend call (see Decisions item 3).
+- `resetInAppContext()` — called from each placement screen's `onStop()` (or platform equivalent), per `first_funding`'s Decisions item 12.
